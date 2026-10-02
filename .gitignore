@@ -3,3 +3,4 @@ i_am_here.flag
 *.log
 __pycache__/
 *.tmp
+projects.json
