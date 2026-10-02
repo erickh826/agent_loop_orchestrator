@@ -1,0 +1,5 @@
+gui_queue/
+i_am_here.flag
+*.log
+__pycache__/
+*.tmp
