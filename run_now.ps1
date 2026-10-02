@@ -5,6 +5,7 @@
 #   .\run_now.ps1 -Project proj-a          run one phase for proj-a
 #   .\run_now.ps1 -Project proj-a -NoPause for remote triggers (Grok / Manus): never waits
 #   .\run_now.ps1 -Project proj-a -DryRun  print the agent command instead of running it
+#   .\run_now.ps1 -Project proj-a -Agent kimi   use agent "kimi" (agents.json) for this run only
 #
 # The script's exit code is the Python orchestrator's exit code
 # (0 ok, 1 error, 2 usage, 3 project already running).
@@ -12,7 +13,8 @@
 param(
     [string]$Project,
     [switch]$NoPause,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string]$Agent
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,6 +98,7 @@ Write-Host ""
 $pyArgs = @()
 if ($DryRun) { $pyArgs += "--dry-run" }
 $pyArgs += @("run", "--project", $Project)
+if ($Agent) { $pyArgs += @("--agent", $Agent) }
 
 # Native stderr must not become a terminating error (e.g. when a remote caller
 # redirects output), and the exit code must come straight from Python.

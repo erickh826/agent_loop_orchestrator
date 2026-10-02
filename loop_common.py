@@ -111,10 +111,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class Project:
-    def __init__(self, name: str, path: Path, media: Path | None = None):
+    def __init__(self, name: str, path: Path, media: Path | None = None, phases: dict | None = None):
         self.name = name
         self.path = path
         self.media = media
+        self.phases = dict(phases or {})  # per-project phase -> agent overrides
 
     @property
     def loop_dir(self) -> Path:
@@ -179,7 +180,7 @@ def get_project(name: str) -> Project:
     media = Path(entry["media"]) if entry.get("media") else None
     if not path.is_dir():
         raise LoopError(f"Project '{name}' path does not exist: {path}")
-    return Project(name, path, media)
+    return Project(name, path, media, entry.get("phases"))
 
 
 # ─────────────────────────────────────────────

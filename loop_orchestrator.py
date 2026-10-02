@@ -10,10 +10,12 @@ executes exactly ONE phase for ONE project:
   → 05_done | 06_failed_requires_human
 
 Commands:
-  run --project N               run one phase for project N
+  run --project N [--agent A]   run one phase for project N (optionally with agent A, this run only)
   status [--project N] [--json] show phase / retries / last_run
   reset --project N [--phase P] back into the loop: phase P (default 03_qa_review), retries 0
   register N PATH [--media P] [--copy-prompts-from M]
+  assign --project N PHASE=AGENT ... | --clear PHASE|all   per-project phase -> agent
+  agents [--json]               list agent CLIs (agents.json) and effective phase mapping
   gui add|next|done|fail|list   GUI task queue (gate only — see loop_gui.py)
   here on|off                   create/remove i_am_here.flag
   --dry-run (global)            print agent command + cwd instead of running it
@@ -45,17 +47,15 @@ from loop_common import (
     fwd, get_project, is_batch, load_projects, loop_home, projects_file, read_json, resolve_bin,
     save_projects, setup_logging, validate_name, write_json_atomic,
 )
+import loop_agents
 import loop_gui
+from loop_agents import PHASES, AgentConfig
 
 MAX_REFACTOR_RETRIES = 3
 
 TERMINAL_PHASES = {"05_done", "06_failed_requires_human"}
 
-# Agent → outer subprocess timeout (seconds). agy's own --print-timeout is 15m (900s);
-# its outer timeout must stay comfortably above that.
-AGY_TIMEOUT    = 1000
-CLAUDE_TIMEOUT = 1200
-CODEX_TIMEOUT  = 900
+# Which CLI runs each phase, how it is invoked and its timeout: see agents.json / loop_agents.py.
 
 EXPECTED_OUTPUT = {
     "01_planning":  ("01_planning",  "spec.md"),
@@ -118,11 +118,21 @@ def save_state(project: Project, state: dict) -> None:
 # ─────────────────────────────────────────────
 #  Prompt Loading
 # ─────────────────────────────────────────────
-def load_prompt(project: Project, agent: str, phase: str) -> str:
-    candidates = [
-        project.agents_dir / agent / f"{phase}.md",
-        ORCH_DIR / "agents" / agent / f"{phase}.md",
-    ]
+def load_prompt(project: Project, agent: str, phase: str, cfg: AgentConfig) -> str:
+    """Agent-specific prompt first, then the prompt written for this phase's default agent,
+    then any other agent's prompt for this phase — project .loop/agents/ before global agents/."""
+    default_agent = cfg.default_phases[phase]
+    candidates = []
+    for base in (project.agents_dir, ORCH_DIR / "agents"):
+        candidates += [base / agent / f"{phase}.md", base / default_agent / f"{phase}.md"]
+        if base.is_dir():
+            candidates += sorted(base.glob(f"*/{phase}.md"))
+    seen, ordered = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    candidates = ordered
     prompt_file = next((p for p in candidates if p.is_file()), None)
     if prompt_file is None:
         tried = "\n  ".join(str(p) for p in candidates)
@@ -149,10 +159,12 @@ def load_prompt(project: Project, agent: str, phase: str) -> str:
 #  DEVNULL → prevents CLI tools hanging waiting for stdin.
 # ─────────────────────────────────────────────
 class Runner:
-    def __init__(self, project: Project, phase: str, dry_run: bool):
+    def __init__(self, project: Project, phase: str, dry_run: bool, cfg: AgentConfig, agent: str):
         self.project = project
         self.phase = phase
         self.dry_run = dry_run
+        self.cfg = cfg
+        self.agent = agent
 
     def _bin(self, name: str) -> list[str]:
         try:
@@ -163,7 +175,22 @@ class Runner:
             log.warning(f"[dry-run] {e}")
             return [f"<NOT FOUND: {name}>"]
 
-    def run(self, agent: str, cmd: list[str], timeout: int) -> subprocess.CompletedProcess | None:
+    def run_agent(self, prompt: str) -> subprocess.CompletedProcess | None:
+        defn = self.cfg.get(self.agent)
+        log.info(f"Dispatching to: {self.agent} (phase {self.phase}, prompt_mode {defn.prompt_mode})")
+        started = datetime.now()
+        prompt_file = self.project.runs_dir / f"{_stamp(started)}_{self.phase}_{self.agent}.prompt.md"
+        if self.dry_run:
+            print(f"[dry-run] prompt  : would be saved to {prompt_file}")
+        else:
+            # Always kept for audit; for prompt_mode file/pointer the agent reads it.
+            prompt_file.parent.mkdir(parents=True, exist_ok=True)
+            prompt_file.write_text(prompt, encoding="utf-8")
+        cmd = [*self._bin(defn.bin), *loop_agents.build_args(defn, self.project, prompt, prompt_file)]
+        return self.run(self.agent, cmd, defn.timeout, started)
+
+    def run(self, agent: str, cmd: list[str], timeout: int,
+            started: datetime | None = None) -> subprocess.CompletedProcess | None:
         cwd = self.project.path
         if is_batch(cmd[0]) and any("\n" in a for a in cmd[1:]):
             # cmd.exe would cut the prompt at its first newline — refuse rather than
@@ -181,7 +208,7 @@ class Runner:
             log.info(f"[dry-run] {agent} not executed; state will not advance")
             return None
 
-        started = datetime.now()
+        started = started or datetime.now()
         try:
             result = _run(cmd, cwd, timeout)
         except subprocess.TimeoutExpired as e:
@@ -199,7 +226,7 @@ class Runner:
     def _save_full_output(self, agent, started, cmd, returncode, stdout, stderr, note="") -> Path:
         runs = self.project.runs_dir
         runs.mkdir(parents=True, exist_ok=True)
-        path = runs / f"{started:%Y%m%d-%H%M%S}-{started.microsecond // 1000:03d}_{self.phase}_{agent}.log"
+        path = runs / f"{_stamp(started)}_{self.phase}_{agent}.log"
         shown = [(_abbrev(a) if "\n" in a else a) for a in cmd]
         path.write_text(
             f"agent      : {agent}\nphase      : {self.phase}\nstarted    : {started.isoformat()}\n"
@@ -211,31 +238,9 @@ class Runner:
         )
         return path
 
-    # ── individual agents ──
-    def agy(self, prompt: str):
-        log.info("Dispatching to: agy (planning)")
-        # agy does NOT use the process cwd as its workspace — it defaults to its own
-        # scratch dir unless told otherwise, so tool calls into the project would be
-        # treated as out-of-sandbox and silently auto-denied in headless mode.
-        # --add-dir fixes that (repeatable: project, then media if configured).
-        # --print-timeout defaults to 5m, too short for reading spec + roadmap + ADRs;
-        # the outer subprocess timeout stays above it.
-        cmd = [*self._bin("agy"), "-p", prompt, "--dangerously-skip-permissions",
-               "--add-dir", str(self.project.path)]
-        if self.project.media is not None:
-            cmd += ["--add-dir", str(self.project.media)]
-        cmd += ["--print-timeout", "15m0s"]
-        return self.run("agy", cmd, AGY_TIMEOUT)
 
-    def claude(self, prompt: str):
-        log.info("Dispatching to: claude code (implementation)")
-        return self.run("claude", [*self._bin("claude"), "-p", prompt, "--allowedTools", "Read,Edit,Bash",
-                                   "--output-format", "text"], CLAUDE_TIMEOUT)
-
-    def codex(self, prompt: str):
-        log.info("Dispatching to: codex (QA / refactor)")
-        return self.run("codex", [*self._bin("codex"), "exec", "--sandbox", "workspace-write", prompt],
-                        CODEX_TIMEOUT)
+def _stamp(t: datetime) -> str:
+    return f"{t:%Y%m%d-%H%M%S}-{t.microsecond // 1000:03d}"
 
 
 def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:
@@ -253,7 +258,7 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # .cmd shims (codex, claude) spawn node as a grandchild that keeps the pipes
+        # .cmd/.bat wrappers spawn node as a grandchild that keeps the pipes
         # open; killing only the shim would leave communicate() hanging. Kill the tree.
         _kill_tree(proc)
         try:
@@ -348,18 +353,18 @@ def qa_passed(project: Project) -> bool:
 # ─────────────────────────────────────────────
 #  Phase Handlers — each returns an exit code
 # ─────────────────────────────────────────────
-def _dispatch(runner: Runner, project: Project, phase: str, agent: str) -> bool:
-    """Run the agent for this phase; True if it succeeded and produced fresh output."""
-    prompt = load_prompt(project, agent, phase)
+def _dispatch(runner: Runner, project: Project, phase: str) -> bool:
+    """Run the selected agent for this phase; True if it succeeded and produced fresh output."""
+    prompt = load_prompt(project, runner.agent, phase, runner.cfg)
     phase_start = time.time()
-    result = getattr(runner, agent)(prompt)
+    result = runner.run_agent(prompt)
     if result is None:  # dry-run
         return False
     return result.returncode == 0 and validate_output(project, phase, phase_start)
 
 
 def handle_planning(project: Project, state: dict, runner: Runner) -> int:
-    if not _dispatch(runner, project, "01_planning", "agy"):
+    if not _dispatch(runner, project, "01_planning"):
         return _not_advanced(runner, "Planning")
     state["phase"] = "02_implement"
     save_state(project, state)
@@ -367,7 +372,7 @@ def handle_planning(project: Project, state: dict, runner: Runner) -> int:
 
 
 def handle_implement(project: Project, state: dict, runner: Runner) -> int:
-    if not _dispatch(runner, project, "02_implement", "claude"):
+    if not _dispatch(runner, project, "02_implement"):
         return _not_advanced(runner, "Implementation")
     state["phase"] = "03_qa_review"
     save_state(project, state)
@@ -375,7 +380,7 @@ def handle_implement(project: Project, state: dict, runner: Runner) -> int:
 
 
 def handle_qa_review(project: Project, state: dict, runner: Runner) -> int:
-    if not _dispatch(runner, project, "03_qa_review", "codex"):
+    if not _dispatch(runner, project, "03_qa_review"):
         return _not_advanced(runner, "QA review")
     if qa_passed(project):
         log.info("QA PASSED. Moving to 05_done.")
@@ -396,7 +401,7 @@ def handle_qa_review(project: Project, state: dict, runner: Runner) -> int:
 
 
 def handle_refactor(project: Project, state: dict, runner: Runner) -> int:
-    if not _dispatch(runner, project, "04_refactor", "codex"):
+    if not _dispatch(runner, project, "04_refactor"):
         return _not_advanced(runner, "Refactor")
     log.info("Refactor complete. Returning to QA review.")
     old = expected_output(project, "03_qa_review")
@@ -436,8 +441,9 @@ DISPATCH = {
 # ─────────────────────────────────────────────
 #  Commands
 # ─────────────────────────────────────────────
-def cmd_run(name: str, dry_run: bool) -> int:
+def cmd_run(name: str, dry_run: bool, agent_override: str | None = None) -> int:
     project = get_project(name)
+    cfg = loop_agents.load_config()
     setup_logging(project.log_file, sys.stdout)
     log.info("=" * 60)
     log.info(f"Loop Engineer Orchestrator — project '{name}'{' [DRY RUN]' if dry_run else ''}")
@@ -465,7 +471,9 @@ def cmd_run(name: str, dry_run: bool) -> int:
             log.error(f"Unknown phase: '{phase}'. Check {project.state_file} manually.")
             return EXIT_ERROR
 
-        runner = Runner(project, phase, dry_run)
+        agent, source = loop_agents.resolve_agent(cfg, project, phase, agent_override)
+        log.info(f"Agent for {phase}: {agent} (from {source})")
+        runner = Runner(project, phase, dry_run, cfg, agent)
         try:
             code = handler(project, state, runner)
         except PhaseFailed as e:
@@ -475,7 +483,7 @@ def cmd_run(name: str, dry_run: bool) -> int:
         updated = load_state(project, dry_run)
         print(f"\n{'=' * 50}")
         print(f"  PROJECT    : {name}{'  [DRY RUN]' if dry_run else ''}")
-        print(f"  RAN PHASE  : {phase}")
+        print(f"  RAN PHASE  : {phase}  (agent: {agent})")
         print(f"  NEXT PHASE : {updated['phase']}")
         print(f"  RETRIES    : {updated.get('refactor_retries', 0)}/{MAX_REFACTOR_RETRIES}")
         print(f"  LOG FILE   : {project.log_file}")
@@ -508,10 +516,12 @@ def cmd_reset(name: str, phase: str, dry_run: bool) -> int:
     return EXIT_OK
 
 
-def project_status(name: str, entry: dict) -> dict:
+def project_status(name: str, entry: dict, cfg: AgentConfig | None) -> dict:
     info = {"project": name, "path": entry.get("path"), "media": entry.get("media"),
             "phase": None, "refactor_retries": None, "max_retries": MAX_REFACTOR_RETRIES,
-            "last_run": None, "status": None, "running": False, "state_file": None, "error": None}
+            "last_run": None, "status": None, "running": False, "state_file": None,
+            "agents": cfg.effective_phases(entry.get("phases")) if cfg else None,
+            "agent_overrides": entry.get("phases") or {}, "error": None}
     path = Path(entry.get("path", ""))
     if not path.is_dir():
         info["error"] = "project path not found"
@@ -538,7 +548,12 @@ def cmd_status(name: str | None, as_json: bool) -> int:
         names = [name]
     else:
         names = sorted(projects)
-    rows = [project_status(n, projects[n]) for n in names]
+    try:
+        cfg = loop_agents.load_config()
+    except LoopError as e:
+        log.warning(f"status: agent mapping unavailable: {e}")
+        cfg = None
+    rows = [project_status(n, projects[n], cfg) for n in names]
 
     if as_json:
         print(json.dumps({"loop_home": str(loop_home()), "projects": rows}, indent=2, ensure_ascii=False))
@@ -579,6 +594,8 @@ def cmd_register(name: str, path: str, media: str | None, copy_from: str | None)
     entry = {"path": fwd(proj_path)}
     if media_path:
         entry["media"] = fwd(media_path)
+    if existed and projects[name].get("phases"):
+        entry["phases"] = projects[name]["phases"]  # keep agent assignments on re-register
     projects[name] = entry
     save_projects(projects)
 
@@ -612,6 +629,73 @@ def cmd_register(name: str, path: str, media: str | None, copy_from: str | None)
 # ─────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────
+def cmd_assign(name: str, pairs: list[str], clear: list[str] | None) -> int:
+    get_project(name)  # validates registration
+    cfg = loop_agents.load_config()
+    projects = load_projects()
+    phases = dict(projects[name].get("phases") or {})
+
+    for item in clear or []:
+        if item == "all":
+            phases.clear()
+        elif item in PHASES:
+            phases.pop(item, None)
+        else:
+            raise LoopError(f"--clear: unknown phase '{item}' (allowed: {', '.join(PHASES)}, all)", EXIT_USAGE)
+    updates = {}
+    for pair in pairs:
+        phase, sep, agent = pair.partition("=")
+        if not sep or not phase or not agent:
+            raise LoopError(f"Expected PHASE=AGENT, got '{pair}'", EXIT_USAGE)
+        updates[phase.strip()] = agent.strip()
+    loop_agents.validate_overrides(cfg, updates)
+    phases.update(updates)
+
+    if phases:
+        projects[name]["phases"] = {p: phases[p] for p in PHASES if p in phases}
+    else:
+        projects[name].pop("phases", None)
+    save_projects(projects)
+    log.info(f"assign '{name}': overrides now {projects[name].get('phases', {})}")
+    effective = cfg.effective_phases(phases)
+    for phase in PHASES:
+        mark = "(project)" if phase in phases else "(default)"
+        print(f"{name:<14} {phase:<14} {effective[phase]:<10} {mark}")
+    return EXIT_OK
+
+
+def cmd_agents(as_json: bool) -> int:
+    cfg = loop_agents.load_config()
+    projects = load_projects()
+    agents = []
+    for name, d in cfg.agents.items():
+        try:
+            resolved = resolve_bin(d.bin)
+        except LoopError:
+            resolved = None
+        agents.append({"agent": name, "bin": d.bin, "resolved": resolved, "prompt_mode": d.prompt_mode,
+                       "timeout": d.timeout, "note": d.note})
+    mapping = {n: {"effective": cfg.effective_phases(e.get("phases")), "overrides": e.get("phases") or {}}
+               for n, e in sorted(projects.items())}
+    if as_json:
+        print(json.dumps({"agents_file": str(loop_agents.AGENTS_FILE), "agents": agents,
+                          "default_phases": cfg.default_phases, "projects": mapping},
+                         indent=2, ensure_ascii=False))
+        return EXIT_OK
+    print(f"Agents ({loop_agents.AGENTS_FILE}):")
+    print(f"  {'AGENT':<10} {'MODE':<8} {'TIMEOUT':<8} RESOLVED")
+    for a in agents:
+        resolved = " ".join(a["resolved"]) if a["resolved"] else "NOT FOUND on PATH"
+        print(f"  {a['agent']:<10} {a['prompt_mode']:<8} {str(a['timeout']) + 's':<8} {resolved}")
+    print("\nPhase -> agent (* = project override):")
+    print(f"  {'PROJECT':<14} " + " ".join(f"{p:<14}" for p in PHASES))
+    print(f"  {'(default)':<14} " + " ".join(f"{cfg.default_phases[p]:<14}" for p in PHASES))
+    for n, m in mapping.items():
+        cells = [(m["effective"][p] + ("*" if p in m["overrides"] else "")) for p in PHASES]
+        print(f"  {n:<14} " + " ".join(f"{c:<14}" for c in cells))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="loop_orchestrator.py", description="Loop Engineer multi-project orchestrator")
     p.add_argument("--dry-run", action="store_true", help="print agent command + cwd instead of running it")
@@ -619,6 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="run one phase for a project")
     r.add_argument("--project", required=True)
+    r.add_argument("--agent", help="use this agent (from agents.json) for this run only")
 
     rs = sub.add_parser("reset", help="put a project back into the loop (retries 0, status running)")
     rs.add_argument("--project", required=True)
@@ -649,6 +734,14 @@ def build_parser() -> argparse.ArgumentParser:
     gf.add_argument("--reason", required=True)
     gsub.add_parser("list")
 
+    a = sub.add_parser("assign", help="set which agent runs each phase for a project")
+    a.add_argument("--project", required=True)
+    a.add_argument("pairs", nargs="*", metavar="PHASE=AGENT")
+    a.add_argument("--clear", nargs="+", metavar="PHASE", help="remove overrides (PHASE ... or all)")
+
+    ag = sub.add_parser("agents", help="list agent CLIs and the effective phase -> agent mapping")
+    ag.add_argument("--json", action="store_true")
+
     h = sub.add_parser("here", help="mark whether the owner is using this computer")
     h.add_argument("state", choices=["on", "off"])
     return p
@@ -667,7 +760,13 @@ def main(argv: list[str] | None = None) -> int:
         setup_logging(loop_home() / "loop.log")
     try:
         if args.command == "run":
-            return cmd_run(args.project, args.dry_run)
+            return cmd_run(args.project, args.dry_run, args.agent)
+        if args.command == "assign":
+            if not args.pairs and not args.clear:
+                raise LoopError("assign: give PHASE=AGENT pairs and/or --clear", EXIT_USAGE)
+            return cmd_assign(args.project, args.pairs, args.clear)
+        if args.command == "agents":
+            return cmd_agents(args.json)
         if args.command == "reset":
             return cmd_reset(args.project, args.phase, args.dry_run)
         if args.command == "status":

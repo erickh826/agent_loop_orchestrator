@@ -1,0 +1,112 @@
+{
+  "agents": {
+    "agy": {
+      "bin": "agy",
+      "args": [
+        "-p",
+        "{prompt}",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "{project}",
+        "{dir_args}",
+        "--print-timeout",
+        "15m0s"
+      ],
+      "dir_args": [
+        "--add-dir",
+        "{dir}"
+      ],
+      "timeout": 1000,
+      "note": "agy does not use cwd as its workspace: --add-dir {project} is required, and with several --add-dir dirs it may resolve RELATIVE paths against the media dir — prompts must use absolute {{WORKSPACE}} paths (the bundled phase prompts do). Outer timeout must stay above --print-timeout (15m)."
+    },
+    "claude": {
+      "bin": "claude",
+      "args": [
+        "-p",
+        "{prompt}",
+        "--allowedTools",
+        "Read,Edit,Bash",
+        "--output-format",
+        "text"
+      ],
+      "timeout": 1200,
+      "note": "Kept as originally configured. --allowedTools has no Write, so claude cannot create NEW files headless (smoke test 2026-10-02); add Write if phase 02 must create files."
+    },
+    "codex": {
+      "bin": "codex",
+      "args": [
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "{prompt}"
+      ],
+      "timeout": 900,
+      "note": "npm .cmd shim — unwrapped to node + codex.js so the multi-line prompt is not cut by cmd.exe. --skip-git-repo-check lets it run in non-git project dirs."
+    },
+    "kimi": {
+      "bin": "kimi",
+      "args": [
+        "-p",
+        "{prompt}",
+        "--output-format",
+        "text"
+      ],
+      "dir_args": [
+        "--add-dir",
+        "{dir}"
+      ],
+      "timeout": 1200,
+      "note": "Do NOT add --auto: kimi rejects '--prompt' combined with '--auto'. -p alone runs to completion."
+    },
+    "gemini": {
+      "bin": "gemini",
+      "args": [
+        "-p",
+        "{prompt}",
+        "--approval-mode",
+        "yolo",
+        "--skip-trust",
+        "-o",
+        "text"
+      ],
+      "dir_args": [
+        "--include-directories",
+        "{dir}"
+      ],
+      "timeout": 1200,
+      "note": "--skip-trust is required headless, otherwise exit 55 (untrusted directory)."
+    },
+    "grok": {
+      "bin": "grok",
+      "prompt_mode": "file",
+      "args": [
+        "--prompt-file",
+        "{prompt_file}",
+        "--always-approve"
+      ],
+      "timeout": 1200
+    },
+    "copilot": {
+      "bin": "copilot",
+      "prompt_mode": "pointer",
+      "args": [
+        "-p",
+        "{prompt}",
+        "--allow-all"
+      ],
+      "dir_args": [
+        "--add-dir",
+        "{dir}"
+      ],
+      "timeout": 1200,
+      "note": "copilot.bat -> powershell copilot.ps1; a multi-line argument would be cut, so the prompt goes through a file. Its .ps1 loads the PowerShell profile; an 'fnm not recognized' error in stderr is harmless."
+    }
+  },
+  "default_phases": {
+    "01_planning": "agy",
+    "02_implement": "claude",
+    "03_qa_review": "codex",
+    "04_refactor": "codex"
+  }
+}
