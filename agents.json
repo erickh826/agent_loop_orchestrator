@@ -25,12 +25,12 @@
         "-p",
         "{prompt}",
         "--allowedTools",
-        "Read,Edit,Bash",
+        "Read,Edit,Write,Bash",
         "--output-format",
         "text"
       ],
       "timeout": 1200,
-      "note": "Kept as originally configured. --allowedTools has no Write, so claude cannot create NEW files headless (smoke test 2026-10-02); add Write if phase 02 must create files."
+      "note": "Write added 2026-10-02 (owner decision): with the original Read,Edit,Bash claude refused to create new files headless, which phase 02 needs (implementation_notes.md, new source files)."
     },
     "codex": {
       "bin": "codex",

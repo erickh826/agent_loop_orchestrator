@@ -81,7 +81,7 @@ Each agent must do three things:
 | gemini | + `--skip-trust` |
 | kimi | − `--auto` (`-p` alone runs to completion without asking) |
 | agy | Args unchanged. Root cause: with several `--add-dir`, agy may resolve **relative** paths against the media dir. The real phase prompts use absolute `{{WORKSPACE}}/…` paths, so the smoke prompt was changed to an absolute output path → PASS. |
-| claude | **Not changed** (kept as originally configured, per the owner's earlier instruction). See open decision below. |
+| claude | + `Write` → `--allowedTools Read,Edit,Write,Bash` (owner decision after round 2; phase 02 is mainly done by claude) |
 
 ### Round 2 (after fixes)
 
@@ -106,12 +106,14 @@ Each agent must do three things:
 | grok | file | 0 | 16.7 | ✓ | ✓ | ✓ | PASS |
 | copilot | pointer | 0 | 34.8 | ✓ | ✓ | ✓ | PASS |
 
-The script exits 1 because claude failed.
+The script exits 1 because claude failed. That run used the original `Read,Edit,Bash`.
+
+**After adding `Write` to claude (owner decision):** `tests/smoke_agents.py … claude` → exit 0, 11.8s, written ✓ / prompt intact ✓ / media read ✓ → **PASS**. All 7 agents now pass.
 
 ## Findings and notes
 
 1. **claude cannot create new files headless with the original `--allowedTools Read,Edit,Bash`.** It refuses rather than falling back to Bash. Phase 02 normally has to create `tasks/02_implement/implementation_notes.md` and often new source files.
-   - **Open decision for the owner:** add `Write` to claude's `--allowedTools` in `agents.json`. The `Read,Edit,Write,Bash` variant passed.
+   - **Resolved:** the owner decided to add `Write`. claude now runs with `--allowedTools Read,Edit,Write,Bash`, and the smoke test passes.
 2. **agy and relative paths:** keep prompts on absolute `{{WORKSPACE}}` paths. A relative path can land in the media dir when the project has `media`.
 3. **copilot:** `copilot.BAT` runs `powershell copilot.ps1` without `-NoProfile`, so the user's PowerShell profile prints `fnm : The term 'fnm' is not recognized` to stderr. This is harmless; the run still passed.
 4. **Multi-line prompts and `.bat`/`.ps1` wrappers:** a CLI that is only reachable through such a wrapper must use `prompt_mode` `pointer` or `file`. Otherwise the orchestrator refuses the run (exit 1) rather than truncating the prompt.
