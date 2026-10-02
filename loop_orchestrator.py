@@ -12,6 +12,7 @@ executes exactly ONE phase for ONE project:
 Commands:
   run --project N               run one phase for project N
   status [--project N] [--json] show phase / retries / last_run
+  reset --project N [--phase P] back into the loop: phase P (default 03_qa_review), retries 0
   register N PATH [--media P] [--copy-prompts-from M]
   gui add|next|done|fail|list   GUI task queue (gate only — see loop_gui.py)
   here on|off                   create/remove i_am_here.flag
@@ -484,6 +485,29 @@ def cmd_run(name: str, dry_run: bool) -> int:
         return code
 
 
+def cmd_reset(name: str, phase: str, dry_run: bool) -> int:
+    """Put a project back into the loop: phase=<phase>, refactor_retries=0, status=running."""
+    project = get_project(name)
+    setup_logging(project.log_file, sys.stdout)
+    with RunLock(project.lock_file, f"Project '{name}'"):
+        migrate_legacy_state(project, dry_run)
+        sf = project.state_file
+        if not sf.exists() and dry_run and project.legacy_state_file.exists():
+            sf = project.legacy_state_file
+        old = read_json(sf) if sf.exists() else None
+        new = dict(old or default_state())
+        new.update({"phase": phase, "refactor_retries": 0, "status": "running"})
+        before = "(no state)" if old is None else (
+            f"phase={old.get('phase')}, retries={old.get('refactor_retries')}, status={old.get('status')}")
+        if dry_run:
+            log.info(f"[dry-run] Would reset '{name}': {before} -> phase={phase}, retries=0, status=running")
+            return EXIT_OK
+        log.info(f"Reset '{name}': {before} -> phase={phase}, retries=0, status=running")
+        save_state(project, new)
+    print(f"reset: {name} -> {phase} (retries 0)")
+    return EXIT_OK
+
+
 def project_status(name: str, entry: dict) -> dict:
     info = {"project": name, "path": entry.get("path"), "media": entry.get("media"),
             "phase": None, "refactor_retries": None, "max_retries": MAX_REFACTOR_RETRIES,
@@ -596,6 +620,11 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="run one phase for a project")
     r.add_argument("--project", required=True)
 
+    rs = sub.add_parser("reset", help="put a project back into the loop (retries 0, status running)")
+    rs.add_argument("--project", required=True)
+    rs.add_argument("--phase", default="03_qa_review", choices=list(DISPATCH),
+                    help="phase to restart from (default: 03_qa_review)")
+
     s = sub.add_parser("status", help="show project phase / retries / last_run")
     s.add_argument("--project")
     s.add_argument("--json", action="store_true", help="machine-readable output")
@@ -634,11 +663,13 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     args = build_parser().parse_args(argv)
-    if args.command != "run":
+    if args.command not in ("run", "reset"):
         setup_logging(loop_home() / "loop.log")
     try:
         if args.command == "run":
             return cmd_run(args.project, args.dry_run)
+        if args.command == "reset":
+            return cmd_reset(args.project, args.phase, args.dry_run)
         if args.command == "status":
             return cmd_status(args.project, args.json)
         if args.command == "register":
